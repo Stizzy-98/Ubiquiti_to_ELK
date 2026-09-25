@@ -1,0 +1,20 @@
+# Secrets and environment-specific files - never commit
+.env
+*.env
+!.env.example
+*.pem
+*.key
+*.crt
+apikey*.txt
+
+# This machine's own ECK deployment file: real encryption keys, internal hostnames, node names.
+# Not part of the shareable project - see README.md.
+eck_stack_values.yaml
+
+# Python / editors / OS
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+.DS_Store

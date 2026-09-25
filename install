@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""install - put Ubiquiti Cartographer into an Elastic Stack (standard ELK, Kubernetes/ECK, Elastic Cloud).
+
+You provide: where Elasticsearch and Kibana are, an API key, and (for a private CA) the CA file - the same
+four things, the same flag names, as Kismet_Cartographer's own `./install`. Everything else - the ingest
+pipeline, the index template and index, a MAC-vendor lookup built from the real IEEE OUI registry, and the
+Kibana data view, charts and dashboard - is created for you.
+
+  ./install --es-url https://localhost:9200 --kibana-url https://localhost:5601 \\
+            --api-key-file ~/uc.key --ca ./ca.crt
+
+  ./install --host 192.168.1.20 --api-key-file ~/uc.key     # no HTTPS: give the address instead of a CA
+
+  ./install --print-api-key-request     # the Dev Tools request that creates a key with exactly the rights needed
+  ./install --print-agent-key-request   # a second, much narrower key for the syslog agent itself (see below)
+  ./install ... --check                 # only test the connection and the key's permissions
+  ./install ... --dry-run               # show what would be created, change nothing
+  ./install ... --save-config           # remember these settings (not the key) so later runs need no flags
+  ./install ... --skip-vendor-lookup    # do not download the IEEE OUI registry (offline/air-gapped installs)
+  ./install ... --remove                # delete everything this installer created
+
+This script only sets up Elasticsearch and Kibana. The other half - the syslog agent that actually receives
+UniFi's events - is a separate, long-running process; see docs/agent-deployment.md and k8s/ to deploy it.
+
+Safe to run again at any time (that is also how you upgrade). Only resources named after --prefix (default
+ubiquiti-*) are created, changed or deleted; nothing else in your cluster is touched.
+Exit codes: 0 ok, 1 a step failed, 2 usage/config problem, 3 cannot connect/authenticate/not permitted.
+"""
+import sys
+
+if sys.version_info < (3, 9):
+    sys.exit("error: Python 3.9 or newer is required (found %s)" % sys.version.split()[0])
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from unifi_cartographer import kibana_objects as ko  # noqa: E402
+from unifi_cartographer.cli import Stop, connection_hint, ok, say, warn  # noqa: E402
+from unifi_cartographer.config import ConfigError, add_connection_args, load_config, write_env_file  # noqa: E402
+from unifi_cartographer.http import Client, ConnectionFailure, HttpError, es_client, kibana_client  # noqa: E402
+from unifi_cartographer.http import kibana_space_path  # noqa: E402
+from unifi_cartographer.mappings import index_settings, mappings, pipeline_body  # noqa: E402
+from unifi_cartographer.names import DEFAULT_PREFIX, TOOL, Names  # noqa: E402
+
+TESTED = "9.4"
+MIN_MAJOR = 8
+OUI_REGISTRY_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+CLUSTER_PRIVS = ["manage_index_templates", "manage_ingest_pipelines", "manage_enrich", "monitor"]
+INDEX_PRIVS = ["manage", "create_index", "read", "write", "view_index_metadata"]
+
+
+def role_descriptor(names: Names, space: str, include_vendor_lookup: bool = True) -> dict:
+    cluster = CLUSTER_PRIVS if include_vendor_lookup else [p for p in CLUSTER_PRIVS if p != "manage_enrich"]
+    return {"cluster": cluster,
+            "indices": [{"names": [f"{names.prefix}*"], "privileges": INDEX_PRIVS}],
+            "applications": [{"application": "kibana-.kibana", "privileges": ["space_all"],
+                              "resources": ["space:" + (space or "default")]}]}
+
+
+def agent_role_descriptor(names: Names) -> dict:
+    """The agent only ever *creates* new documents (see agent.py's Batcher - the bulk action is "create", not
+    "index", since nothing is ever meant to be overwritten), so it needs no cluster privileges at all and only
+    create_doc + read on its own write alias - much narrower than the installer's own key."""
+    return {"indices": [{"names": [f"{names.write_alias}*"], "privileges": ["create_doc", "read"]}]}
+
+
+# ------------------------------------------------------------------------------------------- checks
+def preflight(cfg, args, names: Names) -> dict:
+    info: dict = {"replicas": 0, "version": "?"}
+    say("Checking your stack")
+
+    if not cfg.elastic_url:
+        raise Stop(2, "no Elasticsearch URL", "Pass --es-url https://<host>:9200 (or --host <address>)")
+    if not cfg.api_key:
+        raise Stop(2, "no API key", "Pass --api-key-file <file> (or --api-key, or set ELASTIC_API_KEY). "
+                                    "Create one with: ./install --print-api-key-request")
+    if not args.skip_kibana and not cfg.kibana_url:
+        raise Stop(2, "no Kibana URL", "Pass --kibana-url https://<host>:5601 (or --host <address>)")
+    if not cfg.verify_certs:
+        warn("TLS verification is OFF (--insecure): anyone on the network path can read or change this traffic")
+
+    es = es_client(cfg, timeout=20.0)
+    es.max_retries = 1
+    try:
+        me = es.get("/_security/_authenticate")
+    except ConnectionFailure as e:
+        raise Stop(3, f"cannot reach Elasticsearch at {cfg.elastic_url}: {e}", connection_hint(str(e), cfg.elastic_url))
+    except HttpError as e:
+        if e.status == 401:
+            raise Stop(3, "Elasticsearch rejected the API key (HTTP 401)",
+                       "Pass the 'encoded' value (or id:secret) of a key that has not expired. "
+                       "Create a new one with: ./install --print-api-key-request")
+        raise Stop(3, f"unexpected answer from {cfg.elastic_url}: {e}", "Is this the Elasticsearch URL (not Kibana)?")
+    if not isinstance(me, dict) or "username" not in me:
+        raise Stop(3, f"{cfg.elastic_url} did not answer like Elasticsearch", "Check the URL: it should be the Elasticsearch port.")
+    try:
+        root = es.get("/")
+        info["version"] = root["version"]["number"]
+        if root["version"].get("build_flavor") == "serverless":
+            raise Stop(2, "Elasticsearch Serverless is not supported", "Use Elastic Cloud Hosted or self-managed.")
+        if int(info["version"].split(".")[0]) < MIN_MAJOR:
+            raise Stop(2, f"Elasticsearch {info['version']} is too old", f"Version {MIN_MAJOR}.x or newer is required.")
+        ok(f"Elasticsearch {info['version']} at {cfg.elastic_url}")
+        if not info["version"].startswith(TESTED):
+            warn(f"developed and tested on {TESTED}.x; {info['version']} should work but has not been tested")
+    except HttpError:
+        ok(f"Elasticsearch at {cfg.elastic_url} (version not shown: the key lacks 'monitor')")
+    kind = (me.get("api_key") or {}).get("name")
+    ok(f"authenticated as '{me.get('username', '?')}'" + (f" (API key '{kind}')" if kind else ""))
+    if args.username and me.get("username") != args.username:
+        raise Stop(3, f"--username '{args.username}' was given, but this API key belongs to '{me.get('username')}'",
+                   "Use the right key, or leave --username out.")
+    plain = [n for n, u in (("Elasticsearch", cfg.elastic_url), ("Kibana", "" if args.skip_kibana else cfg.kibana_url))
+             if u.startswith("http://")]
+    if plain:
+        warn(f"the connection to {' and '.join(plain)} is NOT encrypted (http://): use this only on a network you trust")
+
+    need = ["read", "write"] + (["delete_index"] if args.remove else [])
+    try:
+        index_exists = es.exists(f"/{names.index}")
+    except HttpError:
+        index_exists = True
+    if not index_exists and not args.remove:
+        need.append("create_index")
+    cluster_privs = [p for p in CLUSTER_PRIVS if p != "manage_enrich" or not args.skip_vendor_lookup]
+    want = {"cluster": cluster_privs,
+           "index": [{"names": [f"{names.prefix}*"], "privileges": need + ["manage"]}]}
+    space = cfg.space or "default"
+    if not args.skip_kibana:
+        want["application"] = [{"application": "kibana-.kibana", "resources": ["space:" + space], "privileges": ["space_all"]}]
+    try:
+        have = es.post("/_security/user/_has_privileges", want)
+        missing = [f"cluster: {k}" for k, v in have.get("cluster", {}).items() if not v]
+        missing += [f"index {p}: {k}" for p, privs in have.get("index", {}).items() for k, v in privs.items() if not v and k != "manage"]
+        if missing:
+            raise Stop(3, "the API key is missing permissions:\n" + "\n".join("      - " + m for m in missing),
+                       "Create a key with the right role: ./install --print-api-key-request")
+        for app, res in have.get("application", {}).items():
+            for r, privs in res.items():
+                if not all(privs.values()):
+                    warn(f"could not confirm Kibana 'space_all' on {r}")
+        ok("API key has the permissions it needs")
+    except HttpError:
+        warn("could not check the key's privileges; continuing (the first refused request will say what is missing)")
+
+    if not args.skip_kibana:
+        kb = kibana_client(cfg, timeout=30.0)
+        kb.max_retries = 1
+        try:
+            st = kb.get("/api/status")
+        except ConnectionFailure as e:
+            if (args.host and not args.kibana_url and cfg.kibana_url.startswith("https://")
+                    and any(t in str(e).lower() for t in ("wrong version number", "record layer", "unknown protocol"))):
+                cfg.kibana_url = "http://" + cfg.kibana_url[len("https://"):]
+                kb = kibana_client(cfg, timeout=30.0)
+                kb.max_retries = 1
+                say(f"  Kibana is not using TLS; using {cfg.kibana_url}")
+                st = kb.get("/api/status")
+            else:
+                raise Stop(3, f"cannot reach Kibana at {cfg.kibana_url}: {e}", connection_hint(str(e), cfg.kibana_url))
+        except HttpError as e:
+            if e.status in (401, 403):
+                raise Stop(3, f"Kibana refused the key ({e.status})", "The key must be accepted by Kibana too.")
+            raise Stop(3, f"Kibana answered {e.status}: {e}", "Check the Kibana URL.")
+        kver = (st.get("version") or {}).get("number", "?")
+        info["kibana_version"] = kver
+        ok(f"Kibana {kver} at {cfg.kibana_url}" + (f" (space '{cfg.space}')" if cfg.space else ""))
+        if kver == "?" or int(kver.split(".")[0]) < MIN_MAJOR:
+            raise Stop(2, f"Kibana {kver} is not supported", f"Version {MIN_MAJOR}.x or newer is required.")
+        try:
+            kb.get("/api/data_views")
+        except HttpError as e:
+            if e.status == 404 and cfg.space:
+                raise Stop(3, f"Kibana space '{cfg.space}' does not exist", "Create it in Kibana, or omit --space.")
+            if e.status in (401, 403):
+                raise Stop(3, f"Kibana refused the key ({e.status})", "The key needs Kibana access.")
+            raise Stop(3, f"Kibana API check failed: {e}", "")
+        ok("Kibana accepts the key")
+
+    if args.replicas is not None:
+        info["replicas"], why = args.replicas, "as requested"
+    else:
+        try:
+            nodes = es.get("/_cat/nodes", params={"h": "node.role", "format": "json"})
+            data_nodes = sum(1 for n in nodes if any(c in n.get("node.role", "") for c in "dhwcsf"))
+            info["replicas"], why = (1 if data_nodes >= 2 else 0), f"{data_nodes} data node(s)"
+        except HttpError:
+            info["replicas"], why = 0, "could not count data nodes"
+    ok(f"index replicas: {info['replicas']} ({why})")
+    return info
+
+
+# ------------------------------------------------------------------------------------------- Elasticsearch
+def ensure_oui_vendor_lookup(es: Client, names: Names, dry: bool) -> bool:
+    """Loads the real IEEE OUI registry (the authoritative MAC-prefix -> vendor list, ~40k entries, not a
+    hand-picked subset) into `<prefix>oui-vendors` and creates/refreshes the enrich policy the pipeline's
+    `enrich` processor uses to fill in `unifi.client.vendor`. Returns whether it is ready to use.
+
+    Idempotent by design, not by accident: enrich policies are immutable in Elasticsearch and cannot be
+    deleted while a pipeline still references them (which this project's own pipeline does, once installed),
+    so a re-run only creates the policy if it is missing and always re-`_execute`s it - safe to call any
+    number of times, and how a later run picks up IEEE's own registry updates.
+    """
+    if dry:
+        return True
+    import csv
+    import io
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(OUI_REGISTRY_URL, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        warn(f"could not download the IEEE OUI registry ({e}); skipping vendor lookup - "
+            "unifi.client.vendor will stay empty until a later run can reach the internet. "
+            "Pass --skip-vendor-lookup to silence this warning.")
+        return False
+    rows = list(csv.DictReader(io.StringIO(raw)))
+    docs = [{"oui": r["Assignment"].strip().upper(), "vendor": r["Organization Name"].strip()}
+           for r in rows if r.get("Assignment") and r.get("Organization Name")]
+    if not docs:
+        warn("the IEEE OUI registry download did not look like the expected CSV; skipping vendor lookup")
+        return False
+
+    if not es.exists(f"/{names.oui_vendors_index}"):
+        es.put(f"/{names.oui_vendors_index}", {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.refresh_interval": "-1"},
+            "mappings": {"properties": {"oui": {"type": "keyword"}, "vendor": {"type": "keyword"}}},
+        })
+    lines = []
+    for d in docs:
+        lines.append(json.dumps({"index": {"_index": names.oui_vendors_index, "_id": d["oui"]}}))
+        lines.append(json.dumps(d))
+    for i in range(0, len(lines), 4000):  # 4000 ndjson lines = 2000 docs per bulk request
+        es.bulk(("\n".join(lines[i:i + 4000]) + "\n").encode("utf-8"))
+    es.put(f"/{names.oui_vendors_index}/_settings", {"index.refresh_interval": "1s"})
+    es.post(f"/{names.oui_vendors_index}/_refresh")
+
+    try:
+        es.get(f"/_enrich/policy/{names.enrich_policy}")
+        policy_exists = True
+    except HttpError as e:
+        if e.status != 404:
+            raise
+        policy_exists = False
+    if not policy_exists:
+        es.put(f"/_enrich/policy/{names.enrich_policy}",
+              {"match": {"indices": names.oui_vendors_index, "match_field": "oui", "enrich_fields": ["vendor"]}})
+    es.request("POST", f"/_enrich/policy/{names.enrich_policy}/_execute", body=None)
+    ok(f"vendor lookup: {len(docs)} entries from the IEEE OUI registry, enrich policy '{names.enrich_policy}' ready")
+    return True
+
+
+def ensure_pipeline(es: Client, names: Names, dry: bool, include_vendor_lookup: bool) -> str:
+    if dry:
+        return "would be created/updated"
+    es.put(f"/_ingest/pipeline/{names.pipeline}", pipeline_body(names, include_vendor_lookup=include_vendor_lookup))
+    return "created/updated" + ("" if include_vendor_lookup else " (without vendor lookup)")
+
+
+def self_test_pipeline(es: Client, names: Names) -> None:
+    """A document with a real, verified-format CEF message must come out parsed; a bad geo IP must not fail it."""
+    sample = {"_source": {
+        "@timestamp": "2026-01-01T00:00:00.000Z", "message": "test",
+        "source": {"ip": "8.8.8.8"}, "unifi": {"parse_error": "not_cef"},
+    }}
+    sim = es.post(f"/_ingest/pipeline/{names.pipeline}/_simulate", {"docs": [sample]})
+    out = sim["docs"][0]
+    if out.get("error"):
+        raise Stop(1, f"the ingest pipeline itself failed its self-test: {out['error']}", "")
+    doc = out["doc"]["_source"]
+    checks = ("event" in doc and "created" in doc["event"], "tags" in doc and "unifi_parse_error" in doc["tags"],
+             "geo" in doc.get("source", {}))
+    if not all(checks):
+        raise Stop(1, f"the ingest pipeline did not do what it should: {json.dumps(doc)[:300]}", "")
+
+
+def ensure_index(es: Client, names: Names, replicas: int, dry: bool) -> str:
+    if dry:
+        return f"would ensure index template '{names.index_template}' and index '{names.index}'"
+    es.put(f"/_index_template/{names.index_template}", {
+        "index_patterns": [f"{names.write_alias}-*"], "priority": 500,
+        "template": {"settings": {**index_settings(replicas), "index": {**index_settings(replicas)["index"],
+                                                                        "default_pipeline": names.pipeline}},
+                    "mappings": mappings(TOOL)},
+        "_meta": {"managed_by": TOOL},
+    })
+    if es.exists(f"/{names.index}"):
+        meta = (es.get(f"/{names.index}/_mapping")[names.index]["mappings"].get("_meta")) or {}
+        if meta.get("managed_by") != TOOL:
+            raise Stop(1, f"index '{names.index}' already exists and was not created by this installer", "Choose another --prefix.")
+        es.put(f"/{names.index}/_mapping", mappings(TOOL))
+        return f"index template '{names.index_template}': updated; index '{names.index}': already existed (mapping refreshed)"
+    es.put(f"/{names.index}", {"aliases": {names.write_alias: {"is_write_index": True}, names.read_alias: {}}})
+    return f"index template '{names.index_template}': created; index '{names.index}': created (aliases {names.write_alias}, {names.read_alias})"
+
+
+# ------------------------------------------------------------------------------------------- Kibana
+def _same(desired, stored) -> bool:
+    if isinstance(desired, dict) and isinstance(stored, dict):
+        return all(k in stored and _same(v, stored[k]) for k, v in desired.items())
+    if isinstance(desired, str) and isinstance(stored, str) and desired.startswith(("{", "[")):
+        try:
+            return _same(json.loads(desired), json.loads(stored))
+        except ValueError:
+            return desired == stored
+    if isinstance(desired, list) and isinstance(stored, list):
+        return len(desired) == len(stored) and all(_same(a, b) for a, b in zip(desired, stored))
+    return desired == stored
+
+
+def _upsert(kb: Client, obj: dict, dry: bool) -> str:
+    attrs, refs = ko.stringify_json_attrs(obj["attributes"]), obj.get("references", [])
+    try:
+        cur = kb.get(f"/api/saved_objects/{obj['type']}/{obj['id']}")
+    except HttpError as e:
+        if e.status != 404:
+            raise
+        cur = None
+    if cur is not None and _same(attrs, cur.get("attributes", {})) and _same(refs, cur.get("references", [])):
+        return "unchanged"
+    if not dry:
+        kb.post(f"/api/saved_objects/{obj['type']}/{obj['id']}", params={"overwrite": True}, body={"attributes": attrs, "references": refs})
+    return ("would be " if dry else "") + ("created" if cur is None else "updated")
+
+
+def install_kibana(kb: Client, names: Names, kibana_version: str, dry: bool) -> list:
+    done = []
+    try:
+        dv = ko.data_view(names)
+        names.require_owned(dv["id"])
+        try:
+            stored = kb.get(f"/api/data_views/data_view/{dv['id']}")["data_view"]
+        except HttpError as e:
+            if e.status != 404:
+                raise
+            stored = None
+        if stored is None:
+            if not dry:
+                try:
+                    kb.post("/api/data_views/data_view", {"data_view": {**dv["data_view"], "id": dv["id"]}, "override": False})
+                except HttpError as e:
+                    if e.status == 400 and "uplicate" in str(e):
+                        raise Stop(1, f"Kibana already has a data view named '{dv['data_view']['name']}' this installer did not create",
+                                   "Rename/delete it, or use another --prefix.")
+                    raise
+            done.append(f"data view       {dv['id']}  ({'would be created' if dry else 'created'})")
+        else:
+            if not dry:
+                kb.post(f"/api/data_views/data_view/{dv['id']}", {"data_view": {"name": dv["data_view"]["name"]}, "refresh_fields": True})
+            done.append(f"data view       {dv['id']}  ({'would be updated' if dry else 'updated, fields refreshed'})")
+
+        for obj in ko.lens_objects(names):
+            names.require_owned(obj["id"])
+            done.append(f"lens            {obj['id']}  ({_upsert(kb, obj, dry)})")
+        s = ko.search(names)
+        names.require_owned(s["id"])
+        done.append(f"saved search    {s['id']}  ({_upsert(kb, s, dry)})")
+        d = ko.dashboard(names, kibana_version)
+        names.require_owned(d["id"])
+        done.append(f"dashboard       {d['id']}  ({_upsert(kb, d, dry)})")
+    except HttpError as e:
+        if e.status in (401, 403):
+            raise Stop(3, f"Kibana refused to let this API key create objects (HTTP {e.status})",
+                       "The key's account needs Kibana space_all: ./install --print-api-key-request")
+        raise
+    return done
+
+
+def remove_all(es: Client, kb: Client, names: Names, assume_yes: bool) -> None:
+    say("\nThis will delete, if they exist:")
+    lines = [f"index template {names.index_template}", f"index          {names.index} (aliases {names.write_alias}, {names.read_alias})",
+             f"ingest pipeline {names.pipeline}", f"enrich policy   {names.enrich_policy}",
+             f"index           {names.oui_vendors_index}", f"data view       {names.data_view}",
+             f"saved search    {names.search}",
+             f"dashboard       {names.dashboard}"] + [f"lens            {o['id']}" for o in ko.lens_objects(names)]
+    for line in lines:
+        say(f"  - {line}")
+    if not assume_yes and input("Type 'yes' to continue: ").strip().lower() != "yes":
+        say("Nothing deleted.")
+        return
+    for obj in ko.lens_objects(names) + [ko.search(names), ko.dashboard(names, "0")]:
+        try:
+            kb.delete(f"/api/saved_objects/{obj['type']}/{obj['id']}")
+            ok(f"removed {obj['type']} {obj['id']}")
+        except HttpError as e:
+            if e.status != 404:
+                raise Stop(3 if e.status in (401, 403) else 1, f"could not remove {obj['id']} (HTTP {e.status})", "")
+    try:
+        kb.delete(f"/api/data_views/data_view/{names.data_view}")
+        ok("removed data view")
+    except HttpError as e:
+        if e.status != 404:
+            raise Stop(3 if e.status in (401, 403) else 1, f"could not remove the data view (HTTP {e.status})", "")
+    if es.exists(f"/{names.index}"):
+        meta = (es.get(f"/{names.index}/_mapping")[names.index]["mappings"].get("_meta")) or {}
+        if meta.get("managed_by") != TOOL:
+            raise Stop(1, f"index '{names.index}' was not created by this installer", "It is not deleted.")
+        es.delete(f"/{names.index}")
+        ok("removed the index")
+    try:
+        es.delete(f"/_index_template/{names.index_template}")
+        ok("removed the index template")
+    except HttpError as e:
+        if e.status != 404:
+            raise
+    try:
+        es.delete(f"/_ingest/pipeline/{names.pipeline}")
+        ok("removed the ingest pipeline")
+    except HttpError as e:
+        if e.status != 404:
+            raise
+    # The enrich policy first: Elasticsearch refuses to delete one still referenced by a pipeline, which is
+    # why this comes after the pipeline delete above, not before.
+    try:
+        es.delete(f"/_enrich/policy/{names.enrich_policy}")
+        ok("removed the enrich policy")
+    except HttpError as e:
+        if e.status != 404:
+            raise
+    if es.exists(f"/{names.oui_vendors_index}"):
+        es.delete(f"/{names.oui_vendors_index}")
+        ok("removed the OUI vendor lookup index")
+
+
+# ------------------------------------------------------------------------------------------- main
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_connection_args(ap)
+    ap.add_argument("--username", metavar="NAME", help="optional: stop unless the key belongs to this account")
+    ap.add_argument("--replicas", type=int, default=None, help="replicas for the index (default: 1 if 2+ data nodes, else 0)")
+    ap.add_argument("--check", action="store_true", help="only test the connection and permissions, then stop")
+    ap.add_argument("--dry-run", action="store_true", help="show what would be created, change nothing")
+    ap.add_argument("--skip-kibana", action="store_true", help="Elasticsearch only: pipeline, template, index")
+    ap.add_argument("--skip-vendor-lookup", action="store_true",
+                    help="do not download the IEEE OUI registry or set up unifi.client.vendor - for offline/"
+                         "air-gapped installs, or if you do not want the extra manage_enrich cluster privilege")
+    ap.add_argument("--remove", action="store_true", help="delete everything this installer created")
+    ap.add_argument("--yes", action="store_true", help="do not ask before --remove")
+    ap.add_argument("--prefix", default=DEFAULT_PREFIX, metavar="TEXT", help=f"prefix of every name (default {DEFAULT_PREFIX})")
+    ap.add_argument("--save-config", metavar="FILE", nargs="?", const=str(ROOT / ".env"),
+                    help="after a successful run, save the connection settings (never the key) to FILE (default .env here)")
+    ap.add_argument("--test", action="store_true", help="run the offline unit tests first")
+    ap.add_argument("--print-api-key-request", action="store_true", help="print a Dev Tools request for a scoped key, and exit")
+    ap.add_argument("--print-agent-key-request", action="store_true",
+                    help="print a Dev Tools request for the agent's own, much narrower key (create_doc + read "
+                         "only, no cluster privileges), and exit")
+    return ap.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        names = Names(args.prefix)
+    except ValueError as e:
+        say(f"error: {e}")
+        return 2
+
+    if args.print_api_key_request:
+        space = args.space or "default"
+        body = {"name": "ubiquiti-cartographer", "expiration": "90d",
+                "role_descriptors": {"ubiquiti-cartographer": role_descriptor(names, space, not args.skip_vendor_lookup)}}
+        say("# Paste into Kibana -> Dev Tools -> Console, run it, and copy the value of \"encoded\".\n"
+            "# Elasticsearch shows the secret only once. Change \"expiration\" or remove it to suit.")
+        say("POST /_security/api_key\n" + json.dumps(body, indent=2))
+        return 0
+
+    if args.print_agent_key_request:
+        body = {"name": "ubiquiti-agent", "expiration": "180d",
+                "role_descriptors": {"ubiquiti-agent": agent_role_descriptor(names)}}
+        say("# For the syslog agent's own Secret, not for ./install. Paste into Kibana -> Dev Tools -> Console,\n"
+            "# run it, and copy the value of \"encoded\". Elasticsearch shows the secret only once.")
+        say("POST /_security/api_key\n" + json.dumps(body, indent=2))
+        return 0
+
+    try:
+        cfg = load_config(args)
+    except ConfigError as e:
+        say(f"error: {e}")
+        return 2
+    say("Ubiquiti Cartographer installer\n")
+    try:
+        if args.test:
+            say("Running the offline unit tests")
+            if subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests")], cwd=ROOT):
+                raise Stop(1, "unit tests failed", "")
+        info = preflight(cfg, args, names)
+        if args.check:
+            say("\nAll checks passed. Run again without --check to install.")
+            return 0
+        es = es_client(cfg)
+        kb = None if args.skip_kibana else kibana_client(cfg)
+
+        if args.remove:
+            say("\n==> Removing")
+            if kb is None:
+                raise Stop(2, "--remove needs Kibana access", "Do not combine --remove with --skip-kibana.")
+            remove_all(es, kb, names, args.yes)
+            say("\n==> Done")
+            return 0
+
+        say("\n==> Elasticsearch: vendor lookup, ingest pipeline, index template, index")
+        if args.skip_vendor_lookup:
+            say("  vendor lookup: skipped (--skip-vendor-lookup)")
+            vendor_lookup_ready = False
+        else:
+            vendor_lookup_ready = ensure_oui_vendor_lookup(es, names, args.dry_run)
+        ok(f"ingest pipeline {names.pipeline}: {ensure_pipeline(es, names, args.dry_run, vendor_lookup_ready)}")
+        if not args.dry_run:
+            self_test_pipeline(es, names)
+            ok("pipeline self-test passed")
+        ok(ensure_index(es, names, info["replicas"], args.dry_run))
+
+        if kb is not None:
+            say("\n==> Kibana: data view, charts, saved search, dashboard")
+            for line in install_kibana(kb, names, info.get("kibana_version", "9.4.2"), args.dry_run):
+                ok(line)
+
+        if args.save_config and not args.dry_run:
+            try:
+                key_file = getattr(args, "api_key_file", None) or os.environ.get("ELASTIC_API_KEY_FILE", "")
+                written = write_env_file(cfg, Path(args.save_config), key_file)
+                say(f"\n  Saved settings to {Path(args.save_config).resolve()} (mode 600): {', '.join(written)}")
+                if not key_file:
+                    warn("the API key was not given as a file, so it is NOT saved; use --api-key-file to save it next time")
+            except FileExistsError as e:
+                warn(str(e))
+    except Stop as s:
+        say(f"\n  [FAIL] {s.msg}")
+        if s.fix:
+            say(f"         Fix: {s.fix}")
+        return s.code
+    except ConnectionFailure as e:
+        say(f"\n  [FAIL] cannot connect: {e}")
+        return 3
+    except HttpError as e:
+        say(f"\n  [FAIL] {e}")
+        return 3 if e.status in (401, 403) else 1
+    except KeyboardInterrupt:
+        say("\ninterrupted")
+        return 1
+
+    say("\n==> Done" + (" (dry run: nothing was changed)" if args.dry_run else ""))
+    if not args.dry_run and kb is not None:
+        base = cfg.kibana_url + kibana_space_path(cfg.space)
+        say(f"  Dashboard: {base}/app/dashboards#/view/{names.dashboard}")
+        say("\n  Nothing will appear until the syslog agent is running and UniFi is pointed at it - see")
+        say("  docs/agent-deployment.md and k8s/ubiquiti-syslog-agent.yaml.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

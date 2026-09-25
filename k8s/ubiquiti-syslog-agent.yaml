@@ -1,0 +1,104 @@
+# =============================================================================
+# Ubiquiti Cartographer — syslog agent, LoadBalancer VIP 192.168.55.134:514 (UDP)
+#
+# Point UniFi's remote logging at 192.168.55.134, port 514 (see ../docs/agent-deployment.md for exactly
+# where in the UniFi Network application). The agent parses each event and indexes it into Elasticsearch;
+# ./install (run once, from a machine that can reach Elasticsearch/Kibana) creates the ingest pipeline,
+# index and dashboard it writes into.
+#
+# Before applying this file:
+#   1. confirm 192.168.55.134 is actually free in your MetalLB pool (it is the next address after the
+#      .131/.132/.133 already used in eck_stack_values.yaml) - change the annotation below if not.
+#   2. create the ConfigMap holding the agent's code, and the Secret holding its Elasticsearch credential -
+#      the exact commands are in ../docs/agent-deployment.md. Neither is created by this file, on purpose:
+#      a Secret has no place in a YAML file that gets committed to git.
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ubiquiti-syslog-agent
+  namespace: elastic
+  labels:
+    app: ubiquiti-syslog-agent
+spec:
+  replicas: 1                          # UDP has no session affinity to preserve across replicas; one is enough
+  selector:
+    matchLabels:
+      app: ubiquiti-syslog-agent
+  template:
+    metadata:
+      labels:
+        app: ubiquiti-syslog-agent
+    spec:
+      containers:
+        - name: agent
+          image: python:3.13-slim      # stdlib only - no pip install, so any current Python 3 image works
+          workingDir: /app
+          command: ["python3", "-m", "unifi_cartographer.agent"]
+          args:
+            - --es-url=https://elasticsearch-es-http.elastic.svc:9200
+            - --ca=/etc/ubiquiti/ca.crt
+            - --prefix=ubiquiti-
+            - --listen-host=0.0.0.0
+            - --listen-port=5514      # unprivileged; the Service below maps the standard syslog port 514 to it
+            - --health-port=8080
+          env:
+            - name: ELASTIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ubiquiti-es-credentials
+                  key: api-key
+          ports:
+            - name: syslog-udp
+              containerPort: 5514
+              protocol: UDP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: agent-code
+              mountPath: /app/unifi_cartographer
+              readOnly: true
+            - name: es-ca
+              mountPath: /etc/ubiquiti
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests: { memory: 64Mi, cpu: 50m }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: agent-code
+          configMap:
+            name: ubiquiti-agent-code
+        - name: es-ca
+          secret:
+            secretName: ubiquiti-es-credentials
+            items:
+              - key: ca.crt
+                path: ca.crt
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ubiquiti-syslog
+  namespace: elastic
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.55.134
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local        # preserves the UniFi console's real source IP (log.source.address)
+  selector:
+    app: ubiquiti-syslog-agent
+  ports:
+    - name: syslog-udp
+      port: 514
+      targetPort: 5514
+      protocol: UDP
