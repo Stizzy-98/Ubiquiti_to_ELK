@@ -47,7 +47,6 @@ Its role needs to cover `ubiquiti-*` run this to create the API key first naviga
 ```
 ./install --print-api-key-request
 ```
-
 ```
 Copy the `encoded` value into a file and (`chmod 600`) the file.
 
