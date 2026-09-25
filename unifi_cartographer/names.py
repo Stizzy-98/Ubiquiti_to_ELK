@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 DEFAULT_PREFIX = "ubiquiti-"
-TOOL = "ubiquiti-cartographer"
+TOOL = "ubiquiti"
 CONCRETE_VERSION = "v1"
 _VALID = re.compile(r"^[a-z0-9][a-z0-9._-]*-$")
 

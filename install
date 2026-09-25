@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""install - put Ubiquiti Cartographer into an Elastic Stack (standard ELK, Kubernetes/ECK, Elastic Cloud).
+"""install - put Ubiquiti into an Elastic Stack (standard ELK, Kubernetes/ECK, Elastic Cloud).
 
 You provide: where Elasticsearch and Kibana are, an API key, and (for a private CA) the CA file - the same
 four things, the same flag names, as Kismet_Cartographer's own `./install`. Everything else - the ingest
@@ -464,8 +464,8 @@ def main() -> int:
 
     if args.print_api_key_request:
         space = args.space or "default"
-        body = {"name": "ubiquiti-cartographer", "expiration": "90d",
-                "role_descriptors": {"ubiquiti-cartographer": role_descriptor(names, space, not args.skip_vendor_lookup)}}
+        body = {"name": "ubiquiti", "expiration": "90d",
+                "role_descriptors": {"ubiquiti": role_descriptor(names, space, not args.skip_vendor_lookup)}}
         say("# Paste into Kibana -> Dev Tools -> Console, run it, and copy the value of \"encoded\".\n"
             "# Elasticsearch shows the secret only once. Change \"expiration\" or remove it to suit.")
         say("POST /_security/api_key\n" + json.dumps(body, indent=2))
@@ -484,7 +484,7 @@ def main() -> int:
     except ConfigError as e:
         say(f"error: {e}")
         return 2
-    say("Ubiquiti Cartographer installer\n")
+    say("Ubiquiti installer\n")
     try:
         if args.test:
             say("Running the offline unit tests")

@@ -6,10 +6,10 @@ these Elastic Stack tools works for this one too, unchanged.
 Precedence (highest first):
   1. command-line flags (--es-url, --kibana-url, --api-key, --api-key-file, --ca, ...)
   2. real environment variables (ELASTIC_*, KIBANA_*)
-  3. --env-file / $UBIQUITI_CARTOGRAPHER_ENV
+  3. --env-file / $UBIQUITI_ENV
   4. ./.env
   5. <this project>/.env
-  6. ~/.config/ubiquiti-cartographer/credentials.env
+  6. ~/.config/ubiquiti/credentials.env
 
 Nothing here ever prints a secret; Config.__repr__ redacts them.
 """
@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_USER_ENV = Path.home() / ".config" / "ubiquiti-cartographer" / "credentials.env"
-ENV_MARKER = "# Written by Ubiquiti Cartographer (--save-config). Settings only: the API key itself is not stored here."
+DEFAULT_USER_ENV = Path.home() / ".config" / "ubiquiti" / "credentials.env"
+ENV_MARKER = "# Written by Ubiquiti (--save-config). Settings only: the API key itself is not stored here."
 
 
 class ConfigError(Exception):
@@ -124,7 +124,7 @@ def load_config(args: Optional[argparse.Namespace] = None, *, environ: Optional[
     used: List[str] = []
     if env_files is None:
         env_files = [DEFAULT_USER_ENV, REPO_ROOT / ".env", Path.cwd() / ".env"]
-        explicit = (getattr(args, "env_file", None) if args is not None else None) or environ.get("UBIQUITI_CARTOGRAPHER_ENV")
+        explicit = (getattr(args, "env_file", None) if args is not None else None) or environ.get("UBIQUITI_ENV")
         if explicit:
             env_files = list(env_files) + [Path(explicit).expanduser()]
     for p in env_files:  # later entries override earlier ones

@@ -1,5 +1,5 @@
 # =============================================================================
-# Ubiquiti Cartographer — syslog agent, LoadBalancer VIP 192.168.55.134:514 (UDP)
+# Ubiquiti — syslog agent, LoadBalancer VIP 192.168.55.134:514 (UDP)
 #
 # Point UniFi's remote logging at 192.168.55.134, port 514 (see ../docs/agent-deployment.md for exactly
 # where in the UniFi Network application). The agent parses each event and indexes it into Elasticsearch;

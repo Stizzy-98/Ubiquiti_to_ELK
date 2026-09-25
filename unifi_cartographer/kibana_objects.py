@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 
 from .names import Names
 
-BRAND = "Ubiquiti Cartographer"
+BRAND = "Ubiquiti"
 
 
 def stringify_json_attrs(value: Any) -> Any:

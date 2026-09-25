@@ -78,7 +78,7 @@ you want. Everything the agent receives is kept - even a category or a message s
 
 * `curl http://<agent-ip>:8080/stats` (from a machine that can reach it) or the port-forward above:
   `received` should climb whenever UniFi sends anything, and `indexed` should track it closely.
-* **Kibana -> Discover**, data view "Ubiquiti Cartographer", sorted by time descending: events should appear
+* **Kibana -> Discover**, data view "Ubiquiti", sorted by time descending: events should appear
   within a few seconds.
 * If `received` climbs but `indexed` does not, or the dashboard's "Unparsed messages" panel is high, see
   [troubleshooting.md](troubleshooting.md).

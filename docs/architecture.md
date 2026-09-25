@@ -1,6 +1,6 @@
 # Architecture
 
-Ubiquiti Cartographer has two independent halves: a one-time **installer** that sets up Elasticsearch and
+Ubiquiti has two independent halves: a one-time **installer** that sets up Elasticsearch and
 Kibana, and an always-on **agent** that receives UniFi's events. Nothing here polls or authenticates to a
 UniFi console - UniFi only ever pushes to the agent, over plain UDP.
 

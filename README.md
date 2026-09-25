@@ -1,4 +1,4 @@
-# Ubiquiti Cartographer
+# Ubiquiti
 
 Turn the events your [UniFi Network](https://www.ui.com/) console can send over syslog - Admin Activity, Client
 Events, Critical Events, Devices, Security Detections, Triggers, Updates, and per-device logging for the
@@ -42,20 +42,18 @@ run the agent continuously. `./install` only ever talks to their HTTP APIs, so w
 
 ### 1. Create an API key
 
-Its role needs to cover `ubiquiti-*`, which is not the same pattern Kismet_Cartographer's own key
-uses (`kismet-cartographer-*`) - see [docs/security.md](docs/security.md) for why and how to widen an existing
-key's role instead of creating a second one, if you would rather. To make a new one: in Kibana, **Dev Tools ->
-Console**, paste the output of
-
-```bash
+Its role needs to cover `ubiquiti-*` run this to create the API key first navigate to dev tools then paste and run the output:
+```
+```
 ./install --print-api-key-request
 ```
 
-run it, and copy the `encoded` value into a file (`chmod 600`).
+```
+Copy the `encoded` value into a file and (`chmod 600`) the file.
 
 ### 2. Get the CA certificate
 
-Same as any Elastic Stack tool - skip this if your certificate is from a public CA or you do not use HTTPS.
+Skip this if your certificate is from a public CA or you do not use HTTPS.
 See [docs/installation.md](docs/installation.md) for where to find it (standard install, Docker, Kubernetes/ECK).
 
 ### 3. Run the installer
@@ -70,7 +68,7 @@ creates the ingest pipeline, the index, and the Kibana dashboard - and nothing e
 
 ### 4. Deploy the agent
 
-The agent is the part that actually receives events; the dashboard stays empty until it is running and UniFi
+The agent is the part that receives events; the dashboard stays empty until it is running and UniFi
 is pointed at it. Full steps, including the exact UniFi menu and the `kubectl` commands, are in
 [docs/agent-deployment.md](docs/agent-deployment.md):
 
@@ -86,7 +84,7 @@ kubectl apply -f k8s/ubiquiti-syslog-agent.yaml
 In the UniFi Network application, turn on remote logging (Settings -> Control Plane -> Integrations ->
 Activity Logging, or on older UniFi OS versions Settings -> System -> Advanced Features -> Remote Logging) and
 enter the agent's address and port 514/UDP. `./install` printed the dashboard's link at the end; find it again
-under **Dashboards -> "Ubiquiti Cartographer - Overview"**.
+under **Dashboards -> "Ubiquiti - Overview"**.
 
 ## What you get
 

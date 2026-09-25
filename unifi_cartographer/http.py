@@ -187,5 +187,5 @@ def es_client(cfg, timeout: float = 120.0) -> Client:
 def kibana_client(cfg, timeout: float = 120.0) -> Client:
     """Every /api/... call is space-aware because the space path is part of the base URL."""
     return Client(cfg.kibana_url + kibana_space_path(cfg.space), api_key=cfg.api_key, ca_cert=cfg.kibana_ca_cert,
-                  verify=cfg.verify_certs, timeout=timeout, extra_headers={"kbn-xsrf": "ubiquiti-cartographer"},
+                  verify=cfg.verify_certs, timeout=timeout, extra_headers={"kbn-xsrf": "ubiquiti"},
                   server_name=cfg.kibana_tls_server_name)

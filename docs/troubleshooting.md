@@ -47,7 +47,7 @@ both the Service's annotation and where UniFi sends to.
 
 ## The dashboard
 
-**Nothing shows in "Ubiquiti Cartographer - Overview"**
+**Nothing shows in "Ubiquiti - Overview"**
 The dashboard has a 24-hour time range by default (`timeRestore`); widen it. If still empty, confirm the agent
 is receiving and indexing (`/stats`) and that `./install` actually completed (its last line prints the
 dashboard's link, meaning the Kibana objects were created).

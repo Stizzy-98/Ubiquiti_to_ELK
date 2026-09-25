@@ -334,7 +334,7 @@ class NamesTests(unittest.TestCase):
 
 class MappingsTests(unittest.TestCase):
     def test_mapping_covers_every_field_a_real_document_can_have(self):
-        m = mappings.mappings("ubiquiti-cartographer")
+        m = mappings.mappings("ubiquiti")
         self.assertEqual(m["dynamic"], "false")
         for raw in (WIFI_CLIENT, THREAT_BLOCKED, ADMIN_ACCESS, WIRED_CLIENT_CONNECTED, WIRED_CLIENT_DISCONNECTED):
             doc = cef.build_document(raw.encode(), "192.168.55.10", 514, "2026-01-01T00:00:00.000Z")
@@ -374,7 +374,7 @@ class MappingsTests(unittest.TestCase):
         # Regression test: the geoip processor writes a whole object (location, continent_name, ...) to its
         # target field, not a bare geo_point - mapping the target itself as geo_point rejects every document
         # with a public source/destination IP, silently defeating the one enrichment the pipeline does.
-        m = mappings.mappings("ubiquiti-cartographer")
+        m = mappings.mappings("ubiquiti")
         for side in ("source", "destination"):
             geo = m["properties"][side]["properties"]["geo"]
             self.assertNotEqual(geo.get("type"), "geo_point", f"{side}.geo itself must not be geo_point")
