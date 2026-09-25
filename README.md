@@ -43,11 +43,10 @@ run the agent continuously. `./install` only ever talks to their HTTP APIs, so w
 ### 1. Create an API key
 
 Its role needs to cover `ubiquiti-*` run this to create the API key first navigate to dev tools then paste and run the output:
-```bash 
-```
+```bash
 ./install --print-api-key-request
 ```
-
+```
 Copy the `encoded` value into a file and (`chmod 600`) the file.
 
 ### 2. Get the CA certificate
